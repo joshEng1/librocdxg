@@ -24,24 +24,158 @@
  */
 
 #include <atomic>
-#include <cstdio>
 #include <chrono>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 #include <vector>
-
-#include "events_internal.h"
 
 namespace {
 
 std::atomic<HSA_EVENTID> g_next_event_id{1};
 
-wsl::thunk::events::EventState *GetEventState(HsaEvent *event) {
-  return reinterpret_cast<wsl::thunk::events::EventState *>(event->EventData.HWData1);
+class EventState {
+public:
+  EventState(bool manual_reset, bool signaled)
+      : signaled_(signaled), manual_reset_(manual_reset) {}
+
+  void Set() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      signaled_ = true;
+    }
+    if (manual_reset_)
+      condition_.notify_all();
+    else
+      condition_.notify_one();
+  }
+
+  void Reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    signaled_ = false;
+  }
+
+  void ConsumeIfAutoReset() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!manual_reset_ && signaled_)
+      signaled_ = false;
+  }
+
+  bool IsSignaled() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return signaled_;
+  }
+
+  HSAKMT_STATUS Wait(HSAuint32 milliseconds) {
+    return WaitInternal(milliseconds, true);
+  }
+
+  HSAKMT_STATUS WaitUntilSignaled(HSAuint32 milliseconds) {
+    return WaitInternal(milliseconds, false);
+  }
+
+private:
+  HSAKMT_STATUS WaitInternal(HSAuint32 milliseconds, bool consume) {
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    if (!signaled_) {
+      if (milliseconds == HSA_EVENTTIMEOUT_INFINITE) {
+        condition_.wait(lock, [this] { return signaled_; });
+      } else if (!condition_.wait_for(lock, std::chrono::milliseconds(milliseconds),
+                                      [this] { return signaled_; })) {
+        return HSAKMT_STATUS_WAIT_TIMEOUT;
+      }
+    }
+
+    if (consume && !manual_reset_)
+      signaled_ = false;
+
+    return HSAKMT_STATUS_SUCCESS;
+  }
+
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  bool signaled_;
+  bool manual_reset_;
+};
+
+bool IsSupportedEventType(HSA_EVENTTYPE event_type) {
+  return event_type == HSA_EVENTTYPE_SIGNAL;
+}
+
+EventState *GetEventState(HsaEvent *event) {
+  return reinterpret_cast<EventState *>(event->EventData.HWData1);
 }
 
 void SetSignaled(HsaEvent *event, bool signaled) {
   event->EventData.HWData3 = signaled ? 1 : 0;
+}
+
+HSAKMT_STATUS WaitOnMultipleEvents(EventState *states[], HSAuint32 num_events,
+                                   bool wait_on_all, HSAuint32 milliseconds,
+                                   uint64_t *event_age) {
+  if (!states || !num_events)
+    return HSAKMT_STATUS_INVALID_PARAMETER;
+
+  if (event_age)
+    *event_age = 0;
+
+  auto remaining_ms = milliseconds;
+  auto start = std::chrono::steady_clock::now();
+  const bool infinite = milliseconds == HSA_EVENTTIMEOUT_INFINITE;
+
+  if (wait_on_all) {
+    for (HSAuint32 i = 0; i < num_events; i++) {
+      if (!states[i])
+        return HSAKMT_STATUS_INVALID_HANDLE;
+
+      auto status =
+          states[i]->WaitUntilSignaled(infinite ? HSA_EVENTTIMEOUT_INFINITE
+                                                : remaining_ms);
+      if (status != HSAKMT_STATUS_SUCCESS)
+        return status;
+
+      if (!infinite) {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed_ms = static_cast<HSAuint32>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
+                .count());
+        remaining_ms =
+            elapsed_ms >= milliseconds ? 0 : milliseconds - elapsed_ms;
+      }
+    }
+
+    for (HSAuint32 i = 0; i < num_events; i++)
+      states[i]->ConsumeIfAutoReset();
+
+    return HSAKMT_STATUS_SUCCESS;
+  }
+
+  while (true) {
+    for (HSAuint32 i = 0; i < num_events; i++) {
+      if (!states[i])
+        return HSAKMT_STATUS_INVALID_HANDLE;
+
+      auto status = states[i]->Wait(0);
+      if (status == HSAKMT_STATUS_SUCCESS)
+        return status;
+      if (status != HSAKMT_STATUS_WAIT_TIMEOUT)
+        return status;
+    }
+
+    if (!infinite) {
+      auto now = std::chrono::steady_clock::now();
+      auto elapsed_ms = static_cast<HSAuint32>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
+              .count());
+      if (elapsed_ms >= milliseconds)
+        return HSAKMT_STATUS_WAIT_TIMEOUT;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 } // namespace
@@ -54,11 +188,14 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateEvent(HsaEventDescriptor *EventDesc,
   if (!EventDesc || !Event)
     return HSAKMT_STATUS_INVALID_PARAMETER;
 
+  if (!IsSupportedEventType(EventDesc->EventType))
+    return HSAKMT_STATUS_NOT_SUPPORTED;
+
   auto *event = reinterpret_cast<HsaEvent *>(calloc(1, sizeof(HsaEvent)));
   if (!event)
     return HSAKMT_STATUS_NO_MEMORY;
 
-  auto *state = new wsl::thunk::events::EventState(ManualReset, IsSignaled);
+  auto *state = new EventState(ManualReset, IsSignaled);
   if (!state) {
     free(event);
     return HSAKMT_STATUS_NO_MEMORY;
@@ -168,17 +305,15 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtWaitOnMultipleEvents_Ext(HsaEvent *Events[],
     return HSAKMT_STATUS_SUCCESS;
   }
 
-  std::vector<wsl::thunk::events::EventState *> states(NumEvents);
+  std::vector<EventState *> states(NumEvents);
   for (HSAuint32 i = 0; i < NumEvents; i++) {
     if (!Events[i] || !GetEventState(Events[i]))
       return HSAKMT_STATUS_INVALID_HANDLE;
     states[i] = GetEventState(Events[i]);
   }
 
-  auto status = wsl::thunk::events::WaitOnMultipleEvents(states.data(), NumEvents,
-                                                         WaitOnAll,
-                                                         Milliseconds,
-                                                         event_age);
+  auto status = WaitOnMultipleEvents(states.data(), NumEvents, WaitOnAll,
+                                     Milliseconds, event_age);
   if (status == HSAKMT_STATUS_SUCCESS) {
     for (HSAuint32 i = 0; i < NumEvents; i++)
       SetSignaled(Events[i], states[i]->IsSignaled());
