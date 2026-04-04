@@ -55,107 +55,10 @@
 #include "impl/wddm/types.h"
 #include "impl/wddm/device.h"
 #include "impl/wddm/queue.h"
+#include "wddm/adapter_policy.h"
 
 namespace wsl {
 namespace thunk {
-
-namespace {
-
-struct AdapterInfoFallback {
-  uint32_t device_id;
-  int major;
-  int minor;
-  int stepping;
-  uint32_t compute_unit_count;
-  const char *product_name;
-};
-
-const AdapterInfoFallback *FindAdapterInfoFallback(uint32_t device_id) {
-  static const AdapterInfoFallback kFallbacks[] = {
-      {0x73E3, 10, 3, 2, 28, "AMD Radeon PRO W6600"},
-      {0x73EF, 10, 3, 2, 28, "AMD Radeon RX 6700S"},
-  };
-
-  for (const auto &fallback : kFallbacks) {
-    if (fallback.device_id == device_id)
-      return &fallback;
-  }
-
-  return nullptr;
-}
-
-bool IsEnabledEnv(const char *name) {
-  const char *value = getenv(name);
-  if (!value || !value[0])
-    return false;
-
-  return !strcasecmp(value, "1") ||
-         !strcasecmp(value, "true") ||
-         !strcasecmp(value, "yes") ||
-         !strcasecmp(value, "on");
-}
-
-bool HasGfxOverrideEnv() {
-  const char *value = getenv("HSA_OVERRIDE_GFX_VERSION");
-  return value && value[0];
-}
-
-bool ShouldAllowUnsupportedAdapter(uint32_t vendor_id, uint32_t device_id) {
-  if (vendor_id != 0x1002)
-    return false;
-
-  if (IsEnabledEnv("LIBROCDXG_ENABLE_UNSUPPORTED_ADAPTERS"))
-    return true;
-
-  return HasGfxOverrideEnv() && FindAdapterInfoFallback(device_id) != nullptr;
-}
-
-const char *UnsupportedAdapterReason(uint32_t device_id) {
-  if (HasGfxOverrideEnv() && FindAdapterInfoFallback(device_id) != nullptr)
-    return "HSA_OVERRIDE_GFX_VERSION";
-  if (IsEnabledEnv("LIBROCDXG_ENABLE_UNSUPPORTED_ADAPTERS"))
-    return "LIBROCDXG_ENABLE_UNSUPPORTED_ADAPTERS";
-  return nullptr;
-}
-
-void ApplyAdapterInfoFallback(thunk_proxy::DeviceInfo &device_info) {
-  const auto *fallback = FindAdapterInfoFallback(device_info.device_id);
-  if (!fallback)
-    return;
-
-  bool used_fallback = false;
-
-  if (device_info.major == 0) {
-    device_info.major = fallback->major;
-    used_fallback = true;
-  }
-  if (device_info.minor == 0) {
-    device_info.minor = fallback->minor;
-    used_fallback = true;
-  }
-  if (device_info.stepping == 0) {
-    device_info.stepping = fallback->stepping;
-    used_fallback = true;
-  }
-  if (device_info.compute_unit_count == 0) {
-    device_info.compute_unit_count = fallback->compute_unit_count;
-    used_fallback = true;
-  }
-  if (!device_info.product_name[0]) {
-    std::strncpy(device_info.product_name, fallback->product_name,
-                 sizeof(device_info.product_name) - 1);
-    device_info.product_name[sizeof(device_info.product_name) - 1] = '\0';
-    used_fallback = true;
-  }
-
-  if (used_fallback) {
-    pr_warn("Using fallback adapter info for device_id=0x%04x as gfx%d%d%d with %u CUs.\n",
-            fallback->device_id, fallback->major, fallback->minor,
-            fallback->stepping, fallback->compute_unit_count);
-  }
-}
-
-} // namespace
 
 const uint32_t WDDMDevice::cmdbuf_aql_frame_num_ = 0x1000;
 
@@ -624,6 +527,11 @@ uint32_t WDDMDevice::LdsBlocks(const hsa_kernel_dispatch_packet_t *pkt) {
 NTSTATUS WDDMCreateDevices(std::vector<WDDMDevice *> &devices)
 {
   bool supported = false;
+  const char *gfx_override = getenv("HSA_OVERRIDE_GFX_VERSION");
+  const bool has_gfx_override = gfx_override && gfx_override[0];
+  const bool enable_unsupported_adapters =
+      adapter_policy::IsEnabledValue(
+          getenv("LIBROCDXG_ENABLE_UNSUPPORTED_ADAPTERS"));
   D3DKMT_ENUMADAPTERS2 args = {0};
   NTSTATUS ret = DXCORE_CALL(D3DKMTEnumAdapters2(&args));
   if (ret != STATUS_SUCCESS)
@@ -655,11 +563,15 @@ NTSTATUS WDDMCreateDevices(std::vector<WDDMDevice *> &devices)
 
     supported = thunk_proxy::QueryAdapterSupported(query.DeviceIds.DeviceID);
 
-    if (!supported && ShouldAllowUnsupportedAdapter(query.DeviceIds.VendorID,
-                                                    query.DeviceIds.DeviceID)) {
+    if (!supported &&
+        adapter_policy::ShouldAllowUnsupportedAdapter(
+            query.DeviceIds.VendorID, query.DeviceIds.DeviceID,
+            has_gfx_override, enable_unsupported_adapters)) {
       pr_warn("Allowing unsupported AMD adapter device_id=0x%04x because %s is set.\n",
               query.DeviceIds.DeviceID,
-              UnsupportedAdapterReason(query.DeviceIds.DeviceID));
+              adapter_policy::UnsupportedAdapterReason(
+                  query.DeviceIds.DeviceID, has_gfx_override,
+                  enable_unsupported_adapters));
       supported = true;
     }
 
@@ -691,7 +603,15 @@ bool WDDMDevice::ParseDeviceInfo() {
   if (!ret)
     return false;
 
-  ApplyAdapterInfoFallback(device_info_);
+  if (adapter_policy::ApplyAdapterInfoFallback(device_info_)) {
+    const auto *fallback =
+        adapter_policy::FindAdapterInfoFallback(device_info_.device_id);
+    if (fallback) {
+      pr_warn("Using fallback adapter info for device_id=0x%04x as gfx%d%d%d with %u CUs.\n",
+              fallback->device_id, fallback->major, fallback->minor,
+              fallback->stepping, fallback->compute_unit_count);
+    }
+  }
 
   return true;
 }

@@ -24,26 +24,20 @@
  */
 
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
-#include <mutex>
 #include <thread>
+#include <vector>
+
+#include "events_internal.h"
 
 namespace {
 
 std::atomic<HSA_EVENTID> g_next_event_id{1};
 
-struct EventState {
-  std::mutex mutex;
-  std::condition_variable condition;
-  bool signaled = false;
-  bool manual_reset = false;
-};
-
-EventState *GetEventState(HsaEvent *event) {
-  return reinterpret_cast<EventState *>(event->EventData.HWData1);
+wsl::thunk::events::EventState *GetEventState(HsaEvent *event) {
+  return reinterpret_cast<wsl::thunk::events::EventState *>(event->EventData.HWData1);
 }
 
 void SetSignaled(HsaEvent *event, bool signaled) {
@@ -64,13 +58,11 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtCreateEvent(HsaEventDescriptor *EventDesc,
   if (!event)
     return HSAKMT_STATUS_NO_MEMORY;
 
-  auto *state = new EventState();
+  auto *state = new wsl::thunk::events::EventState(ManualReset, IsSignaled);
   if (!state) {
     free(event);
     return HSAKMT_STATUS_NO_MEMORY;
   }
-  state->signaled = IsSignaled;
-  state->manual_reset = ManualReset;
 
   event->EventId = g_next_event_id.fetch_add(1, std::memory_order_relaxed);
   event->EventData.EventType = EventDesc->EventType;
@@ -103,12 +95,7 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtSetEvent(HsaEvent *Event) {
   if (!state)
     return HSAKMT_STATUS_INVALID_HANDLE;
 
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->signaled = true;
-  }
-  state->condition.notify_all();
-
+  state->Set();
   SetSignaled(Event, true);
   return HSAKMT_STATUS_SUCCESS;
 }
@@ -122,11 +109,8 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtResetEvent(HsaEvent *Event) {
   if (!state)
     return HSAKMT_STATUS_INVALID_HANDLE;
 
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->signaled = false;
-  }
-  SetSignaled(Event, false);
+  state->Reset();
+  SetSignaled(Event, state->IsSignaled());
   return HSAKMT_STATUS_SUCCESS;
 }
 
@@ -135,9 +119,11 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtQueryEventState(HsaEvent *Event) {
   if (!Event)
     return HSAKMT_STATUS_INVALID_HANDLE;
 
-  if (!GetEventState(Event))
+  auto *state = GetEventState(Event);
+  if (!state)
     return HSAKMT_STATUS_INVALID_HANDLE;
 
+  SetSignaled(Event, state->IsSignaled());
   return HSAKMT_STATUS_SUCCESS;
 }
 
@@ -182,76 +168,23 @@ HSAKMT_STATUS HSAKMTAPI hsaKmtWaitOnMultipleEvents_Ext(HsaEvent *Events[],
     return HSAKMT_STATUS_SUCCESS;
   }
 
-  auto remaining_ms = Milliseconds;
-  auto start = std::chrono::steady_clock::now();
-  const bool infinite = Milliseconds == HSA_EVENTTIMEOUT_INFINITE;
-
-  if (WaitOnAll) {
-    for (HSAuint32 i = 0; i < NumEvents; i++) {
-      if (!Events[i] || !GetEventState(Events[i]))
-        return HSAKMT_STATUS_INVALID_HANDLE;
-
-      auto *state = GetEventState(Events[i]);
-      std::unique_lock<std::mutex> lock(state->mutex);
-      if (!state->signaled) {
-        if (infinite) {
-          state->condition.wait(lock, [state] { return state->signaled; });
-        } else {
-          if (!state->condition.wait_for(lock, std::chrono::milliseconds(remaining_ms),
-                                         [state] { return state->signaled; })) {
-            return HSAKMT_STATUS_WAIT_TIMEOUT;
-          }
-        }
-      }
-
-      if (!state->manual_reset)
-        state->signaled = false;
-
-      SetSignaled(Events[i], state->manual_reset ? true : false);
-
-      if (!infinite) {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed_ms = static_cast<HSAuint32>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
-        if (elapsed_ms >= Milliseconds)
-          remaining_ms = 0;
-        else
-          remaining_ms = Milliseconds - elapsed_ms;
-      }
-    }
-
-    return HSAKMT_STATUS_SUCCESS;
+  std::vector<wsl::thunk::events::EventState *> states(NumEvents);
+  for (HSAuint32 i = 0; i < NumEvents; i++) {
+    if (!Events[i] || !GetEventState(Events[i]))
+      return HSAKMT_STATUS_INVALID_HANDLE;
+    states[i] = GetEventState(Events[i]);
   }
 
-  while (true) {
-    for (HSAuint32 i = 0; i < NumEvents; i++) {
-      if (!Events[i] || !GetEventState(Events[i]))
-        return HSAKMT_STATUS_INVALID_HANDLE;
-
-      auto *state = GetEventState(Events[i]);
-      {
-        std::lock_guard<std::mutex> lock(state->mutex);
-        if (!state->signaled)
-          continue;
-
-        if (!state->manual_reset)
-          state->signaled = false;
-
-        SetSignaled(Events[i], state->manual_reset ? true : false);
-        return HSAKMT_STATUS_SUCCESS;
-      }
-    }
-
-    if (!infinite) {
-      auto now = std::chrono::steady_clock::now();
-      auto elapsed_ms = static_cast<HSAuint32>(
-          std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
-      if (elapsed_ms >= Milliseconds)
-        return HSAKMT_STATUS_WAIT_TIMEOUT;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  auto status = wsl::thunk::events::WaitOnMultipleEvents(states.data(), NumEvents,
+                                                         WaitOnAll,
+                                                         Milliseconds,
+                                                         event_age);
+  if (status == HSAKMT_STATUS_SUCCESS) {
+    for (HSAuint32 i = 0; i < NumEvents; i++)
+      SetSignaled(Events[i], states[i]->IsSignaled());
   }
+
+  return status;
 }
 
 HSAKMT_STATUS HSAKMTAPI hsaKmtOpenSMI(HSAuint32 NodeId, int *fd) {
