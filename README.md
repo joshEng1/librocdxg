@@ -38,8 +38,6 @@ What worked in testing:
 
 ## What Changed In This Fork
 
-These changes are the reason this fork exists.
-
 ### 1. The GPU can be forced to run as `gfx1030`
 
 The RX 6700S needed:
@@ -51,8 +49,6 @@ export HSA_OVERRIDE_GFX_VERSION=10.3.0
 This fork makes that override apply more consistently in the `librocdxg` device and topology paths.
 
 ### 2. Software queue allocation was changed
-
-This was the biggest fix.
 
 The default software queue path could make the GPU appear alive without actually running work correctly. This fork adds a user controlled queue allocation path through:
 
@@ -334,7 +330,3 @@ docker run -it \
 For general ROCm documentation, see:
 
 [Use ROCm on Radeon and Ryzen](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/index.html#)
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the general contribution process.
