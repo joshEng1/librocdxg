@@ -76,6 +76,8 @@ public:
             cmdbuf(0),
             cmdbuf_addr(cmdbuf_addr),
             cmdbuf_size(cmdbuf_size),
+            queue_mem(0),
+            queue_addr(0),
             queue_engine(engine),
             use_hws(use_hws),
             prio(thunk_proxy::kNormal) {
@@ -101,6 +103,11 @@ public:
                          uint64_t command_size,
                          uint64_t fence_value);
   hsa_status_t SetPriority(hsa_amd_queue_priority_t priority);
+  bool AllowNullSyncobjFallback(void) const {
+    return !use_hws && queue_engine == device->GetComputeEngine() &&
+           adapter_policy::IsEnabledValue(
+               std::getenv("LIBROCDXG_ALLOW_NULL_SYNCOBJ"));
+  }
 
   uint64_t *GetSyncAddr(void) const { return sync_addr; }
   uint64_t GetCmdbufAddr(void) const { return cmdbuf_addr; }
@@ -175,7 +182,19 @@ public:
   hsa_status_t Process(void);
   uint64_t * GetDoorbellPtr() const { return (uint64_t *)&doorbell_signal_value_; }
   void RingDoorbell();
+  void SetSharedSubmitSyncobj(D3DKMT_HANDLE handle, uint64_t *addr,
+                              uint64_t signal_value,
+                              uint64_t completion_value) {
+    use_shared_submit_syncobj_ = true;
+    shared_submit_syncobj_ = handle;
+    shared_submit_sync_addr_ = addr;
+    pending_submit_signal_value_ = signal_value;
+    pending_submit_completion_value_ = completion_value;
+  }
 private:
+  uint64_t CompletedSubmissionValue(void) const;
+  hsa_status_t WaitForCompletedSubmission(uint64_t value);
+
   hsa_status_t KernelDispatchAqlToPm4(char *cpu, hsa_kernel_dispatch_packet_t *packet);
   hsa_status_t BarrierGenericAqlToPm4(char *cpu, hsa_barrier_and_packet_t *packet, bool is_or = false);
   struct amd_aql_pm4_ib {
@@ -210,6 +229,12 @@ private:
   uint32_t cmdbuf_aql_frame_size;
 
   uint64_t  *signal_addr_;
+  bool use_shared_submit_syncobj_;
+  D3DKMT_HANDLE shared_submit_syncobj_;
+  uint64_t *shared_submit_sync_addr_;
+  uint64_t completed_submission_value_;
+  uint64_t pending_submit_signal_value_;
+  uint64_t pending_submit_completion_value_;
   bool platform_atomic_support_;
   bool needs_barrier;
   bool ready_to_submit;
@@ -239,6 +264,8 @@ private:
   GpuMemoryHandle amd_queue_mem_;
   amd_queue_v2_t *amd_queue_;
   amd_queue_v2_t *amd_queue_rocr_;
+  GpuMemoryHandle debug_marker_mem_;
+  uint64_t *debug_marker_addr_;
   uint64_t doorbell_signal_value_;
   volatile std::atomic<int64_t> *error_code_;
   std::thread aql_to_pm4_thread_;

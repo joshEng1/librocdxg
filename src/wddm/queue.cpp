@@ -43,6 +43,8 @@
 #include <cstring>
 #include <cinttypes>
 #include <cstddef>
+#include <algorithm>
+#include <cstdlib>
 
 #include "impl/wddm/queue.h"
 #include "impl/registers.h"
@@ -62,9 +64,71 @@ extern hsa_status_t hsakmt_hsa_ven_amd_loader_query_host_address(
 namespace wsl {
 namespace thunk {
 
+namespace {
+
+bool EnvEnabled(const char *name) {
+  const char *value = std::getenv(name);
+  if (!value)
+    return false;
+
+  return !strcasecmp(value, "1") || !strcasecmp(value, "true") ||
+         !strcasecmp(value, "yes") || !strcasecmp(value, "on");
+}
+
+uint32_t DispatchUserDataCount(const amd_kernel_code_t *kernel_object) {
+  uint32_t count = 0;
+  const auto props = kernel_object->kernel_code_properties;
+
+  if (AMD_HSA_BITS_GET(
+          props,
+          AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER))
+    count += 4;
+  if (AMD_HSA_BITS_GET(props,
+                       AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_DISPATCH_PTR))
+    count += 2;
+  if (AMD_HSA_BITS_GET(props, AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_QUEUE_PTR))
+    count += 2;
+  if (AMD_HSA_BITS_GET(
+          props,
+          AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_KERNARG_SEGMENT_PTR))
+    count += 2;
+  if (AMD_HSA_BITS_GET(props,
+                       AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_DISPATCH_ID))
+    count += 2;
+  if (AMD_HSA_BITS_GET(
+          props,
+          AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_FLAT_SCRATCH_INIT))
+    count += 2;
+  if (AMD_HSA_BITS_GET(
+          props,
+          AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_PRIVATE_SEGMENT_SIZE))
+    count += 1;
+  if (AMD_HSA_BITS_GET(
+          props,
+          AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_GRID_WORKGROUP_COUNT_X))
+    count += 1;
+  if (AMD_HSA_BITS_GET(
+          props,
+          AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_GRID_WORKGROUP_COUNT_Y))
+    count += 1;
+  if (AMD_HSA_BITS_GET(
+          props,
+          AMD_KERNEL_CODE_PROPERTIES_ENABLE_SGPR_GRID_WORKGROUP_COUNT_Z))
+    count += 1;
+
+  return count;
+}
+
+} // namespace
+
 hsa_status_t WDDMQueue::SwsInit(void) {
-  if (!device->CreateSyncobj(&syncobj, &sync_addr))
+  if (AllowNullSyncobjFallback()) {
+    syncobj = 0;
+    sync_addr = NULL;
+    pr_warn_once("using shared compute submit syncobj fallback\n");
+  } else if (!device->CreateSyncobj(&syncobj, &sync_addr)) {
     return HSA_STATUS_ERROR;
+  }
 
   if (device->AllocUserQueueMemFromUMD()) {
 
@@ -77,11 +141,13 @@ hsa_status_t WDDMQueue::SwsInit(void) {
 
     auto code = device->CreateGpuMemory(create_info, &gpu_mem);
     if (code != ErrorCode::Success) {
-      device->DestroySyncobj(syncobj);
+      if (syncobj)
+        device->DestroySyncobj(syncobj);
       return HSA_STATUS_ERROR;
     }
 
     queue_mem = gpu_mem->GetGpuMemoryHandle();
+    queue_addr = gpu_mem->GpuAddress();
     queue = gpu_mem->GetAllocationHandle(0);
   }
 
@@ -89,7 +155,16 @@ hsa_status_t WDDMQueue::SwsInit(void) {
 }
 
 hsa_status_t WDDMQueue::SwsFini(void) {
-  device->DestroySyncobj(syncobj);
+  if (queue_mem) {
+    auto queue_gpu_mem = GpuMemory::Convert(queue_mem);
+    delete queue_gpu_mem;
+    queue_mem = 0;
+    queue_addr = 0;
+    queue = 0;
+  }
+
+  if (syncobj)
+    device->DestroySyncobj(syncobj);
 
   return HSA_STATUS_SUCCESS;
 }
@@ -246,14 +321,22 @@ ComputeQueue::ComputeQueue(WDDMDevice *device,
                ib_size(0),
                sync_point(0),
                cmdbuf_aql_frame_write_index(0),
-               cmdbuf_aql_frame_size(0),
-               needs_barrier(true),
-               ready_to_submit(false),
-               platform_atomic_support_(false),
-               signal_addr_(NULL),
-               thread_stop_(false),
-               scratch_waves_(device->MaxScratchSlotsPerCu() * device->ComputeUnitCount()),
-               scratch_size_per_wave_(0),
+                cmdbuf_aql_frame_size(0),
+                 needs_barrier(true),
+                 ready_to_submit(false),
+                 platform_atomic_support_(false),
+                 signal_addr_(NULL),
+                 debug_marker_mem_(0),
+                 debug_marker_addr_(nullptr),
+                 use_shared_submit_syncobj_(false),
+                 shared_submit_syncobj_(0),
+                 shared_submit_sync_addr_(NULL),
+                 completed_submission_value_(0),
+                pending_submit_signal_value_(0),
+                pending_submit_completion_value_(0),
+                thread_stop_(false),
+                scratch_waves_(device->MaxScratchSlotsPerCu() * device->ComputeUnitCount()),
+                scratch_size_per_wave_(0),
                scratch_size_(0),
                scratch_base_(nullptr) {
   bool ret = device->CreateQueue(this);
@@ -269,7 +352,66 @@ ComputeQueue::ComputeQueue(WDDMDevice *device,
   amd_queue_ = reinterpret_cast<amd_queue_v2_t*>(gpu_mem->GpuAddress());
 
   amd_queue_rocr_ = (amd_queue_v2_t*)((char*)ring_rptr - offsetof(amd_queue_v2_t, read_dispatch_id));
+  std::memcpy(amd_queue_, amd_queue_rocr_, sizeof(*amd_queue_));
+  if (EnvEnabled("LIBROCDXG_DEBUG_WRITE_MARKER")) {
+    GpuMemory *marker_gpu_mem = nullptr;
+    auto marker_code = device->CreateGpuMemory(create_info, &marker_gpu_mem);
+    assert(marker_code == ErrorCode::Success);
+    debug_marker_mem_ = marker_gpu_mem->GetGpuMemoryHandle();
+    debug_marker_addr_ =
+        reinterpret_cast<uint64_t *>(marker_gpu_mem->GpuAddress());
+    *debug_marker_addr_ = 0;
+  }
   aql_to_pm4_thread_ = std::thread(AqlToPm4Thread, this);
+}
+
+uint64_t ComputeQueue::CompletedSubmissionValue(void) const {
+  if (use_shared_submit_syncobj_)
+    return completed_submission_value_;
+  if (sync_addr)
+    return *sync_addr;
+
+  return ring_rptr->load(std::memory_order_acquire);
+}
+
+hsa_status_t ComputeQueue::WaitForCompletedSubmission(uint64_t value) {
+  if (use_shared_submit_syncobj_) {
+    if (completed_submission_value_ >= value)
+      return HSA_STATUS_SUCCESS;
+
+    uint64_t signal_value = pending_submit_signal_value_;
+    pr_debug("wait shared completion queue %p target=%" PRIx64
+             " local=%" PRIx64 " signal=%" PRIx64 " current=%" PRIx64 "\n",
+             ring, value, completed_submission_value_, signal_value,
+             shared_submit_sync_addr_ ? *shared_submit_sync_addr_ : 0);
+    if (!device->CpuWait(&shared_submit_syncobj_, &signal_value, 1, false))
+      return HSA_STATUS_ERROR;
+
+    completed_submission_value_ = pending_submit_completion_value_;
+    pr_debug("wait shared completion queue %p reached local=%" PRIx64
+             " signal=%" PRIx64 "\n",
+             ring, completed_submission_value_, signal_value);
+    return completed_submission_value_ >= value ? HSA_STATUS_SUCCESS
+                                                : HSA_STATUS_ERROR;
+  }
+
+  if (sync_addr != NULL)
+    return device->CpuWait(&syncobj, &value, 1, false) ? HSA_STATUS_SUCCESS
+                                                        : HSA_STATUS_ERROR;
+
+  pr_debug("poll completion queue %p target=%" PRIx64 " current=%" PRIx64
+           "\n",
+           ring, value, CompletedSubmissionValue());
+  while (CompletedSubmissionValue() < value) {
+    if (error_code_ && error_code_->load(std::memory_order_acquire) != 0)
+      return HSA_STATUS_ERROR;
+
+    std::this_thread::sleep_for(std::chrono::microseconds(20));
+  }
+  pr_debug("poll completion queue %p reached=%" PRIx64 "\n", ring,
+           CompletedSubmissionValue());
+
+  return HSA_STATUS_SUCCESS;
 }
 
 ComputeQueue::~ComputeQueue() {
@@ -286,6 +428,11 @@ ComputeQueue::~ComputeQueue() {
   if (scratch_base_) {
     auto scratch_gpu_mem = GpuMemory::Convert(scratch_mem_);
     delete scratch_gpu_mem;
+  }
+
+  if (debug_marker_addr_) {
+    auto debug_marker_gpu_mem = GpuMemory::Convert(debug_marker_mem_);
+    delete debug_marker_gpu_mem;
   }
 
   auto amd_queue_gpu_mem = GpuMemory::Convert(amd_queue_mem_);
@@ -559,6 +706,8 @@ hsa_status_t ComputeQueue::Init(void) {
   ib_start_addr = cmdbuf_addr;
   cmdbuf_aql_frame_size = device->GetAqlFrameSize();
   platform_atomic_support_ = device->SupportPlatformAtomic();
+  if (EnvEnabled("LIBROCDXG_DISABLE_PLATFORM_ATOMIC"))
+    platform_atomic_support_ = false;
 
   return ret;
 }
@@ -638,6 +787,29 @@ ComputeQueue::KernelDispatchAqlToPm4(char *cpu, hsa_kernel_dispatch_packet_t *pa
            kernel_object->kernel_code_properties, entry,
            kernel_object->workgroup_group_segment_byte_size,
            packet->group_segment_size);
+  if (packet->kernarg_address && kernel_object->kernarg_segment_byte_size) {
+    const auto *kernarg_words =
+        reinterpret_cast<const uint64_t *>(packet->kernarg_address);
+    const uint32_t kernarg_word_count = static_cast<uint32_t>(
+        std::min<uint64_t>(4, kernel_object->kernarg_segment_byte_size / 8));
+    if (kernarg_word_count == 1) {
+      pr_debug("kernarg words=%u [0]=%#" PRIx64 "\n", kernarg_word_count,
+               kernarg_words[0]);
+    } else if (kernarg_word_count == 2) {
+      pr_debug("kernarg words=%u [0]=%#" PRIx64 " [1]=%#" PRIx64 "\n",
+               kernarg_word_count, kernarg_words[0], kernarg_words[1]);
+    } else if (kernarg_word_count == 3) {
+      pr_debug("kernarg words=%u [0]=%#" PRIx64 " [1]=%#" PRIx64
+               " [2]=%#" PRIx64 "\n",
+               kernarg_word_count, kernarg_words[0], kernarg_words[1],
+               kernarg_words[2]);
+    } else if (kernarg_word_count >= 4) {
+      pr_debug("kernarg words=%u [0]=%#" PRIx64 " [1]=%#" PRIx64
+               " [2]=%#" PRIx64 " [3]=%#" PRIx64 "\n",
+               kernarg_word_count, kernarg_words[0], kernarg_words[1],
+               kernarg_words[2], kernarg_words[3]);
+    }
+  }
 
   if (packet->setup == 0 || packet->setup > 3)
     return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
@@ -654,6 +826,36 @@ ComputeQueue::KernelDispatchAqlToPm4(char *cpu, hsa_kernel_dispatch_packet_t *pa
 
   assert(packet->private_segment_size >= kernel_object->workitem_private_segment_byte_size);
   UpdateScratch(packet->private_segment_size, wave32);
+  if (scratch_size_ == 0) {
+    std::memcpy(amd_queue_->scratch_resource_descriptor,
+                amd_queue_rocr_->scratch_resource_descriptor,
+                sizeof(amd_queue_->scratch_resource_descriptor));
+    std::memcpy(amd_queue_->alt_scratch_resource_descriptor,
+                amd_queue_rocr_->alt_scratch_resource_descriptor,
+                sizeof(amd_queue_->alt_scratch_resource_descriptor));
+    amd_queue_->scratch_backing_memory_location =
+        amd_queue_rocr_->scratch_backing_memory_location;
+    amd_queue_->scratch_backing_memory_byte_size =
+        amd_queue_rocr_->scratch_backing_memory_byte_size;
+    amd_queue_->scratch_wave64_lane_byte_size =
+        amd_queue_rocr_->scratch_wave64_lane_byte_size;
+    amd_queue_->scratch_max_use_index = amd_queue_rocr_->scratch_max_use_index;
+    amd_queue_->alt_scratch_backing_memory_location =
+        amd_queue_rocr_->alt_scratch_backing_memory_location;
+    amd_queue_->alt_scratch_dispatch_limit_x =
+        amd_queue_rocr_->alt_scratch_dispatch_limit_x;
+    amd_queue_->alt_scratch_dispatch_limit_y =
+        amd_queue_rocr_->alt_scratch_dispatch_limit_y;
+    amd_queue_->alt_scratch_dispatch_limit_z =
+        amd_queue_rocr_->alt_scratch_dispatch_limit_z;
+    amd_queue_->alt_scratch_wave64_lane_byte_size =
+        amd_queue_rocr_->alt_scratch_wave64_lane_byte_size;
+    amd_queue_->alt_compute_tmpring_size =
+        amd_queue_rocr_->alt_compute_tmpring_size;
+    amd_queue_->compute_tmpring_size = amd_queue_rocr_->compute_tmpring_size;
+    pr_debug("synced zero scratch queue state from rocr queue=%p shadow=%p\n",
+             amd_queue_rocr_, amd_queue_);
+  }
 
   amd_signal_t *signal = (amd_signal_t *)packet->completion_signal.handle;
 
@@ -665,6 +867,14 @@ ComputeQueue::KernelDispatchAqlToPm4(char *cpu, hsa_kernel_dispatch_packet_t *pa
   const bool is_barrier_packet = (packet->header >> HSA_PACKET_HEADER_BARRIER) & 0x1;
   if (is_barrier_packet && needs_barrier)
     i += cmd_util.BuildBarrier(cpu + i);
+
+  if (debug_marker_addr_) {
+    const uint64_t pre_dispatch_marker =
+        0x1111000000000000ULL |
+        (static_cast<uint64_t>(cmdbuf_aql_frame_write_index + 1) << 8);
+    i += cmd_util.BuildWriteData64Command(cpu + i, debug_marker_addr_,
+                                          pre_dispatch_marker);
+  }
 
   // flush cache
   i += cmd_util.BuildAcquireMem(major, cpu + i);
@@ -685,8 +895,9 @@ ComputeQueue::KernelDispatchAqlToPm4(char *cpu, hsa_kernel_dispatch_packet_t *pa
   info.ldsBlks = lds_blks;
   info.pAmdQueue = amd_queue_;
   info.wave32 = wave32;
-  info.srd = UpdateIndexStride(
-    info.pAmdQueue->scratch_resource_descriptor[3], wave32);
+  info.srd = info.pAmdQueue->scratch_resource_descriptor[3];
+  if (!EnvEnabled("LIBROCDXG_KEEP_SCRATCH_INDEX_STRIDE"))
+    info.srd = UpdateIndexStride(info.srd, wave32);
   info.pScratchBase = ScratchBase();
   info.scratchSizePerWave = ScratchSizePerWave();
   memset(info.scratchBaseOffset, 0, sizeof(info.scratchBaseOffset));
@@ -694,9 +905,49 @@ ComputeQueue::KernelDispatchAqlToPm4(char *cpu, hsa_kernel_dispatch_packet_t *pa
 
   size_t size;
   size = cmd_util.BuildDispatch(&info, cpu + i);
+  const auto *dispatch =
+      reinterpret_cast<const DispatchTemplate *>(cpu + i);
+  const uint32_t user_data_count = DispatchUserDataCount(kernel_object);
+  pr_debug("dispatch shadow queue=%p rocr queue=%p user_data=%u srd3 shadow=%#x rocr=%#x final=%#x tmpring shadow=%#x rocr=%#x\n",
+           amd_queue_, amd_queue_rocr_, user_data_count,
+           amd_queue_->scratch_resource_descriptor[3],
+           amd_queue_rocr_->scratch_resource_descriptor[3], info.srd,
+           amd_queue_->compute_tmpring_size,
+           amd_queue_rocr_->compute_tmpring_size);
+  pr_debug("dispatch scratch shadow=%#x %#x %#x %#x rocr=%#x %#x %#x %#x\n",
+           amd_queue_->scratch_resource_descriptor[0],
+           amd_queue_->scratch_resource_descriptor[1],
+           amd_queue_->scratch_resource_descriptor[2],
+           amd_queue_->scratch_resource_descriptor[3],
+           amd_queue_rocr_->scratch_resource_descriptor[0],
+           amd_queue_rocr_->scratch_resource_descriptor[1],
+           amd_queue_rocr_->scratch_resource_descriptor[2],
+           amd_queue_rocr_->scratch_resource_descriptor[3]);
+  pr_debug("dispatch pm4 pgm=%#x:%#x rsrc=%#x/%#x tmpring=%#x dims=%#x,%#x,%#x init=%#x\n",
+           dispatch->program_regs.compute_pgm_hi,
+           dispatch->program_regs.compute_pgm_lo,
+           dispatch->program_resource_regs.compute_pgm_rsrc1,
+           dispatch->program_resource_regs.compute_pgm_rsrc2,
+           dispatch->resource_regs.compute_tmpring_size,
+           dispatch->dispatch_direct.dim_x, dispatch->dispatch_direct.dim_y,
+           dispatch->dispatch_direct.dim_z,
+           dispatch->dispatch_direct.dispatch_initiator);
+  for (uint32_t user_data_index = 0; user_data_index < user_data_count;
+       ++user_data_index) {
+    pr_debug("dispatch user_data[%u]=%#x\n", user_data_index,
+             dispatch->compute_user_data_regs.compute_user_data[user_data_index]);
+  }
   for (int j = 0; j < info.offsetCnt; j++)
     AppendCmdbufSratchBaseOffset(i + info.scratchBaseOffset[j]);
   i += size;
+
+  if (debug_marker_addr_) {
+    const uint64_t post_dispatch_marker =
+        0x2222000000000000ULL |
+        (static_cast<uint64_t>(cmdbuf_aql_frame_write_index + 1) << 8);
+    i += cmd_util.BuildWriteData64Command(cpu + i, debug_marker_addr_,
+                                          post_dispatch_marker);
+  }
 
   needs_barrier = (packet->completion_signal.handle == 0);
 
@@ -936,7 +1187,7 @@ hsa_status_t ComputeQueue::SwitchAql2PM4(void) {
     // 3) The queue is empty now, submit the package right now.
     if (!(aql_packet->completion_signal.handle) &&
         (cmdbuf_aql_frame_write_index % WDDMDevice::GetAqlFrameNum()) &&
-        (*sync_addr != sync_point))
+        (CompletedSubmissionValue() != sync_point))
       return HSA_STATUS_SUCCESS;
 
     break;
@@ -976,10 +1227,12 @@ hsa_status_t ComputeQueue::Process(void) {
     // wait for next few cmdbuf slots to be free
     // If wptr catch up the rptr in the cmdbuf, this needs wait for the rptr to free the cmdbuf.
     // Here the wptr comes from queue->cmdbuf_aql_frame_write_index, while rptr comes from *queue->sync_addr.
-    if (*sync_addr + WDDMDevice::GetAqlFrameNum() <= cmdbuf_aql_frame_write_index) {
+    if (CompletedSubmissionValue() + WDDMDevice::GetAqlFrameNum() <=
+        cmdbuf_aql_frame_write_index) {
       uint64_t value = cmdbuf_aql_frame_write_index - WDDMDevice::GetAqlFrameNum() + 1;
-      if (!device->CpuWait(&syncobj, &value, 1, false))
-        return HSA_STATUS_ERROR;
+      ret = WaitForCompletedSubmission(value);
+      if (ret != HSA_STATUS_SUCCESS)
+        return ret;
     }
 
     ret = SwitchAql2PM4();
@@ -993,11 +1246,18 @@ hsa_status_t ComputeQueue::Process(void) {
     if (ret != HSA_STATUS_SUCCESS)
       return ret;
 
+    if (use_shared_submit_syncobj_) {
+      ret = WaitForCompletedSubmission(cmdbuf_aql_frame_write_index);
+      if (ret != HSA_STATUS_SUCCESS)
+        return ret;
+    }
+
     // CPU wait for GPU fence, and cpu update the signal.
     if (!platform_atomic_support_ && signal_addr_) {
       // CPU wait for GPU fence
-      if (!device->CpuWait(&syncobj, &cmdbuf_aql_frame_write_index, 1, false))
-        return HSA_STATUS_ERROR;
+      ret = WaitForCompletedSubmission(cmdbuf_aql_frame_write_index);
+      if (ret != HSA_STATUS_SUCCESS)
+        return ret;
       //CPU update completional signal
       atomic::Decrement(signal_addr_);
       signal_addr_ = NULL;
@@ -1005,8 +1265,10 @@ hsa_status_t ComputeQueue::Process(void) {
 
     ready_to_submit = false;
 
-    pr_debug("done %p wptr=%" PRIx64 " rptr=%" PRIx64 "\n",
-             ring, ring_wptr->load(), ring_rptr->load());
+    pr_debug("done %p wptr=%" PRIx64 " rptr=%" PRIx64 " marker=%#" PRIx64
+             "\n",
+             ring, ring_wptr->load(), ring_rptr->load(),
+             debug_marker_addr_ ? *debug_marker_addr_ : 0);
   }
 
   return HSA_STATUS_SUCCESS;

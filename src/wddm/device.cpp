@@ -61,19 +61,35 @@ namespace thunk {
 
 const uint32_t WDDMDevice::cmdbuf_aql_frame_num_ = 0x1000;
 
-WDDMDevice::WDDMDevice(D3DKMT_HANDLE adapter, LUID adapter_luid, uint32_t node_id)
-  : adapter_(adapter), adapter_luid_(adapter_luid), node_id_(node_id) {
+WDDMDevice::WDDMDevice(D3DKMT_HANDLE adapter, LUID adapter_luid,
+                       uint32_t node_id)
+    : adapter_(adapter), adapter_luid_(adapter_luid), device_(0),
+      shared_compute_context_(0), shared_compute_context_refcount_(0),
+      shared_compute_submit_syncobj_(0), shared_compute_submit_syncaddr_(nullptr),
+      shared_compute_submit_fence_value_(1),
+      page_queue_(0), page_syncobj_(0), page_fence_addr_(nullptr),
+      page_fence_value_(0), cmdbuf_size_(0), cmdbuf_aql_frame_size_(0),
+      node_id_(node_id) {
   memset(&device_info_, 0, sizeof(device_info_));
 
   ParseDeviceInfo();
   CreateDevice();
   SetPowerOptimization(false);
   CreatePagingQueue();
+  if (adapter_policy::IsEnabledValue(
+          std::getenv("LIBROCDXG_ALLOW_NULL_SYNCOBJ"))) {
+    if (!CreateSyncobj(&shared_compute_submit_syncobj_,
+                       &shared_compute_submit_syncaddr_))
+      pr_warn_once("failed to create shared compute submit syncobj during device init\n");
+  }
   InitCmdbufInfo();
   QuerySegmentInfo();
 }
 
 WDDMDevice::~WDDMDevice() {
+  if (shared_compute_submit_syncobj_ != 0)
+    DestroySyncobj(shared_compute_submit_syncobj_);
+
   DestroyPagingQueue();
   SetPowerOptimization(true);
   DestroyDevice();
@@ -348,13 +364,45 @@ bool WDDMDevice::Unlock(D3DKMT_HANDLE handle) {
   return false;
 }
 
+bool WDDMDevice::AcquireSharedComputeSubmitSyncobj(D3DKMT_HANDLE *handle,
+                                                   uint64_t **addr,
+                                                   uint64_t *value) {
+  std::lock_guard<std::mutex> lock(shared_compute_context_mutex_);
+  if (shared_compute_submit_syncobj_ == 0)
+    return false;
+
+  *handle = shared_compute_submit_syncobj_;
+  *addr = shared_compute_submit_syncaddr_;
+  *value =
+      shared_compute_submit_fence_value_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 bool WDDMDevice::CreateContext(int engine, D3DKMT_HANDLE *handle) {
   void *priv_data;
   int priv_size;
+  const bool share_compute_context =
+      engine == GetComputeEngine() &&
+      adapter_policy::IsEnabledValue(
+          std::getenv("LIBROCDXG_SHARE_COMPUTE_CONTEXT"));
 
   int ordinal = EngineOrdinal(engine, &device_info_);
-  if (ordinal < 0)
+  if (ordinal < 0) {
+    pr_err("invalid engine %#x for node %u\n", engine, node_id_);
     return false;
+  }
+
+  if (share_compute_context) {
+    std::lock_guard<std::mutex> lock(shared_compute_context_mutex_);
+    if (shared_compute_context_ != 0) {
+      shared_compute_context_refcount_++;
+      *handle = shared_compute_context_;
+      pr_debug("reused shared context %#x for engine %#x ordinal %d node %u refs %u\n",
+               *handle, engine, ordinal, node_id_,
+               shared_compute_context_refcount_);
+      return true;
+    }
+  }
 
   priv_size = thunk_proxy::GetContextPrivDataSize();
   priv_data = malloc(priv_size);
@@ -378,17 +426,36 @@ bool WDDMDevice::CreateContext(int engine, D3DKMT_HANDLE *handle) {
   NTSTATUS ret = DXCORE_CALL(D3DKMTCreateContextVirtual(&args));
   if (ret == STATUS_SUCCESS) {
     *handle = args.hContext;
+    if (share_compute_context) {
+      std::lock_guard<std::mutex> lock(shared_compute_context_mutex_);
+      shared_compute_context_ = args.hContext;
+      shared_compute_context_refcount_ = 1;
+    }
+    pr_debug("created context %#x for engine %#x ordinal %d node %u\n",
+             args.hContext, engine, ordinal, node_id_);
     free(priv_data);
     return true;
   }
 
   free(priv_data);
 
-  pr_err("fail %x\n", ret);
+  pr_err("fail %x creating context for engine %#x ordinal %d node %u\n",
+         ret, engine, ordinal, node_id_);
   return false;
 }
 
 bool WDDMDevice::DestroyContext(D3DKMT_HANDLE handle) {
+  {
+    std::lock_guard<std::mutex> lock(shared_compute_context_mutex_);
+    if (handle != 0 && handle == shared_compute_context_) {
+      assert(shared_compute_context_refcount_ > 0);
+      shared_compute_context_refcount_--;
+      if (shared_compute_context_refcount_ > 0)
+        return true;
+      shared_compute_context_ = 0;
+    }
+  }
+
   D3DKMT_DESTROYCONTEXT args = {0};
   args.hContext = handle;
 
@@ -597,6 +664,7 @@ NTSTATUS WDDMCreateDevices(std::vector<WDDMDevice *> &devices)
 
 bool WDDMDevice::ParseDeviceInfo() {
   bool ret;
+  const char *gfx_override = getenv("HSA_OVERRIDE_GFX_VERSION");
 
   memset(&device_info_, 0, sizeof(device_info_));
   ret = thunk_proxy::ParseAdapterInfo(adapter_, &device_info_);
@@ -610,6 +678,19 @@ bool WDDMDevice::ParseDeviceInfo() {
       pr_warn("Using fallback adapter info for device_id=0x%04x as gfx%d%d%d with %u CUs.\n",
               fallback->device_id, fallback->major, fallback->minor,
               fallback->stepping, fallback->compute_unit_count);
+    }
+  }
+
+  if (adapter_policy::HasValidGfxOverrideValue(gfx_override)) {
+    char dummy = '\0';
+    uint32_t major = 0, minor = 0, step = 0;
+    if (sscanf(gfx_override, "%u.%u.%u%c", &major, &minor, &step, &dummy) ==
+        3) {
+      device_info_.major = major;
+      device_info_.minor = minor;
+      device_info_.stepping = step;
+      pr_warn("Using HSA override gfx%u%u%u for device_id=0x%04x.\n", major,
+              minor, step, device_info_.device_id);
     }
   }
 
@@ -693,7 +774,7 @@ void WDDMDevice::DestroyQueue(WDDMQueue *queue) {
 }
 
 bool WDDMDevice::SubmitToSwQueue(WDDMQueue *queue, uint64_t command_addr,
-                                uint64_t command_size, uint64_t fence_value) {
+                                 uint64_t command_size, uint64_t fence_value) {
   void *priv_data;
   int priv_size;
 
@@ -711,6 +792,11 @@ bool WDDMDevice::SubmitToSwQueue(WDDMQueue *queue, uint64_t command_addr,
   args.pPrivateDriverData = priv_data;
   args.PrivateDriverDataSize = priv_size;
 
+  pr_debug("submit sw queue context %#x queue %#x command %#" PRIx64
+           " size %#" PRIx64 " fence %#" PRIx64 " syncobj %#x\n",
+           queue->context, queue->queue, command_addr, command_size,
+           fence_value, queue->syncobj);
+
   NTSTATUS ret = DXCORE_CALL(D3DKMTSubmitCommand(&args));
   if (ret != STATUS_SUCCESS) {
     pr_err("fail %x\n", ret);
@@ -719,9 +805,29 @@ bool WDDMDevice::SubmitToSwQueue(WDDMQueue *queue, uint64_t command_addr,
   }
 
   free(priv_data);
+  pr_debug("submit sw queue done context %#x fence %#" PRIx64 "\n",
+           queue->context, fence_value);
 
-  if (!GpuSignal(queue->context, &queue->syncobj, &fence_value, 1))
+  D3DKMT_HANDLE signal_syncobj = queue->syncobj;
+  uint64_t *signal_syncaddr = queue->sync_addr;
+  uint64_t signal_value = fence_value;
+  if (signal_syncobj == 0) {
+    if (queue->queue_engine != GetComputeEngine())
+      return true;
+    if (!AcquireSharedComputeSubmitSyncobj(&signal_syncobj, &signal_syncaddr,
+                                           &signal_value))
+      return false;
+    static_cast<ComputeQueue *>(queue)->SetSharedSubmitSyncobj(
+        signal_syncobj, signal_syncaddr, signal_value, fence_value);
+  }
+
+  pr_debug("signal sw queue context %#x syncobj %#x fence %#" PRIx64 "\n",
+           queue->context, signal_syncobj, signal_value);
+  if (!GpuSignal(queue->context, &signal_syncobj, &signal_value, 1))
     return false;
+  pr_debug("signal sw queue done context %#x syncobj %#x fence %#" PRIx64
+           "\n",
+           queue->context, signal_syncobj, signal_value);
 
   return true;
 }

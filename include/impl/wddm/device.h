@@ -45,11 +45,13 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <ntstatus.h>
 #include <strings.h>
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "impl/wddm/types.h"
@@ -185,9 +187,35 @@ public:
 
   // Both legacy HWS and stage 1 HWS use KMD to alloc use queue memory,
   // return false by default
-  bool AllocUserQueueMemFromUMD(void) const { return false; }
+  bool AllocUserQueueMemFromUMD(void) const {
+    const char *alloc_user_queue_from_umd =
+        std::getenv("LIBROCDXG_ALLOC_USER_QUEUE_FROM_UMD");
+    if (alloc_user_queue_from_umd &&
+        (!strcasecmp(alloc_user_queue_from_umd, "1") ||
+         !strcasecmp(alloc_user_queue_from_umd, "true") ||
+         !strcasecmp(alloc_user_queue_from_umd, "yes") ||
+         !strcasecmp(alloc_user_queue_from_umd, "on"))) {
+      return true;
+    }
+
+    return false;
+  }
 
   bool IsHwsEnabled(int engine) {
+    const char *force_hws = std::getenv("LIBROCDXG_FORCE_HWS");
+    if (force_hws &&
+        (!strcasecmp(force_hws, "1") || !strcasecmp(force_hws, "true") ||
+         !strcasecmp(force_hws, "yes") || !strcasecmp(force_hws, "on"))) {
+      return true;
+    }
+
+    const char *disable_hws = std::getenv("LIBROCDXG_DISABLE_HWS");
+    if (disable_hws &&
+        (!strcasecmp(disable_hws, "1") || !strcasecmp(disable_hws, "true") ||
+         !strcasecmp(disable_hws, "yes") || !strcasecmp(disable_hws, "on"))) {
+      return false;
+    }
+
     return thunk_proxy::GetHwsEnabled(engine, &device_info_);
   }
 
@@ -212,6 +240,9 @@ private:
   bool DestroyPagingQueue(void);
   void *Lock(D3DKMT_HANDLE handle);
   bool Unlock(D3DKMT_HANDLE handle);
+  bool AcquireSharedComputeSubmitSyncobj(D3DKMT_HANDLE *handle,
+                                         uint64_t **addr,
+                                         uint64_t *value);
   bool CreateContext(int engine, D3DKMT_HANDLE *handle);
   bool DestroyContext(D3DKMT_HANDLE handle);
 
@@ -224,6 +255,12 @@ private:
   D3DKMT_HANDLE adapter_;
   LUID adapter_luid_;
   D3DKMT_HANDLE device_;
+  std::mutex shared_compute_context_mutex_;
+  D3DKMT_HANDLE shared_compute_context_;
+  uint32_t shared_compute_context_refcount_;
+  D3DKMT_HANDLE shared_compute_submit_syncobj_;
+  uint64_t *shared_compute_submit_syncaddr_;
+  std::atomic<uint64_t> shared_compute_submit_fence_value_;
 
   D3DKMT_HANDLE page_queue_;
   D3DKMT_HANDLE page_syncobj_;
