@@ -1,6 +1,6 @@
 # AMD ROCDXG Library
 
-This fork is a practical WSL guide and patched `librocdxg` build for getting ROCm to work on an AMD Radeon RX 6700S laptop GPU under WSL 2.
+This fork is a patched `librocdxg` build for getting ROCm to work on an AMD Radeon RX 6700S laptop GPU under WSL 2. 
 
 The important idea is simple:
 
@@ -13,7 +13,7 @@ The important idea is simple:
 This repo is for people who:
 
 1. Use WSL 2 on Windows
-2. Have an AMD laptop GPU, especially an RX 6700S
+2. Have a gfx1032 GPU.
 3. Can get ROCm to partially detect the GPU, but real tensor copies or inference hang
 
 ## Tested Device And Software
@@ -318,15 +318,12 @@ docker run -it \
     --shm-size 8G \
     rocm/pytorch:latest
 ```
-
-## Known Limitations
-
-1. JAX under WSL is not covered by this repo
-2. `amd-smi` style monitoring is not supported the same way it is on native Linux
-3. Some driver and hardware combinations may still behave differently from the RX 6700S setup documented here
-
 ## Documentation
 
 For general ROCm documentation, see:
 
 [Use ROCm on Radeon and Ryzen](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/index.html#)
+
+## Sources
+
+This gave me a good outline on what variables needed to be changed: https://github.com/ROCm/ROCm/issues/1756
