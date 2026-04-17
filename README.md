@@ -1,120 +1,317 @@
-# AMD ROCDXG Libary
-A user-mode library that enables ROCm functionality on Windows Subsystem for Linux (WSL). This library allows users to run GPU-accelerated Linux workloads under WSL, supporting AI, HPC, and other experimental use cases.
+# AMD ROCDXG Library
 
-## Prerequisites
-- Download the compatible Windows driver from [AMD Drivers](https://www.amd.com/en/support/download/drivers.html)
-- Download and install the latest stable version of WSL2 [WSL Install](https://learn.microsoft.com/en-us/windows/wsl/install)
-- The following tools are required to build librocdxg:
-  - CMake >= 3.15
-  - GCC >= 11.4
+This fork is a practical WSL guide and patched `librocdxg` build for getting ROCm to work on an AMD Radeon RX 6700S laptop GPU under WSL 2.
 
-## Quickstart
+The important idea is simple:
 
-### 1. Install Windows SDK
+1. WSL can sometimes see the GPU without being able to actually use it
+2. This fork adds the fixes that made real GPU execution work on an RX 6700S
+3. You still need the right WSL and bash environment variables when you run ROCm or PyTorch
 
-Download and install the Windows SDK from [windows SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/)
+## Who This Is For
 
-### 2. Install AMD ROCm package
+This repo is for people who:
 
-please install the ROCm package by following the official ROCm Installation Quick Guide:
+1. Use WSL 2 on Windows
+2. Have an AMD laptop GPU, especially an RX 6700S
+3. Can get ROCm to partially detect the GPU, but real tensor copies or inference hang
 
-[ROCm Installation Quick Start](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html)
+## Tested Device And Software
 
-> ***Note***
-> This step may take several minutes, depending on internet connection and system speed.
-> Follow the quick-start guide for package repository setup and ROCm package installation.
+This is the setup used while testing this fork:
 
-### 3. Build librocdxg
-Run the following commands in your WSL console:
+1. GPU: AMD Radeon RX 6700S
+2. OS: Windows 11
+3. WSL distro: Ubuntu 24.04
+4. ROCm: 7.2.x
+5. Python: 3.12
+6. PyTorch: ROCm 7.2 wheels for Ubuntu 24.04
 
-1. Clone librocdxg repository to your local WSL.
+What worked in testing:
+
+1. `rocminfo` detected the GPU
+2. `torch.cuda.is_available()` returned `True`
+3. `torch.cuda.device_count()` returned `1`
+4. `torch.cuda.get_device_name(0)` returned `AMD Radeon RX 6700S`
+5. Repeated host to GPU tensor copies succeeded
+
+
+## What Changed In This Fork
+
+These changes are the reason this fork exists.
+
+### 1. The GPU can be forced to run as `gfx1030`
+
+The RX 6700S needed:
 
 ```bash
-git clone https://github.com/ROCm/librocdxg.git
+export HSA_OVERRIDE_GFX_VERSION=10.3.0
+```
+
+This fork makes that override apply more consistently in the `librocdxg` device and topology paths.
+
+### 2. Software queue allocation was changed
+
+This was the biggest fix.
+
+The default software queue path could make the GPU appear alive without actually running work correctly. This fork adds a user controlled queue allocation path through:
+
+```bash
+export LIBROCDXG_ALLOC_USER_QUEUE_FROM_UMD=1
+```
+
+In plain language, this changes how the GPU command inbox is created so the RX 6700S WSL stack actually accepts it.
+
+### 3. SDMA copy engines are disabled for this setup
+
+The RX 6700S could detect the GPU, but real CPU to GPU tensor copies would hang until timeout unless these were disabled:
+
+```bash
+export HSA_ENABLE_SDMA=0
+export HSA_ENABLE_PEER_SDMA=0
+```
+
+### 4. Dispatch and scratch handling were improved
+
+This fork also includes:
+
+1. missing kernel launch values were added
+2. temporary GPU memory settings were copied more reliably
+
+### 5. Queue cleanup was fixed
+
+The UMD allocated software queue path now properly frees its queue memory on teardown.
+
+## Prerequisites
+
+Before building this repo, make sure you have:
+
+1. Windows 11 with WSL 2 installed
+2. Ubuntu 24.04 or Ubuntu 22.04 inside WSL
+3. A recent Windows AMD driver
+4. ROCm installed in WSL
+5. Windows SDK installed on Windows
+6. `cmake` and `g++` installed in WSL
+
+Useful references:
+
+1. [AMD Drivers](https://www.amd.com/en/support/download/drivers.html)
+2. [Install WSL](https://learn.microsoft.com/en-us/windows/wsl/install)
+3. [ROCm Installation Quick Start](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html)
+4. [Windows SDK](https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/)
+
+## Build And Install
+
+Run these commands inside WSL.
+
+### 1. Clone the repo
+
+```bash
+git clone https://github.com/joshEng1/librocdxg.git
 cd librocdxg
 ```
 
-2. Verify that ROCm has been successfully installed.
+### 2. Confirm ROCm is installed
 
 ```bash
-tree -L 1 /opt
+ls /opt
 ```
 
-Expected result:
+You should see a ROCm installation, usually something like `rocm` or `rocm-7.2.0`.
+
+### 3. Build the library
+
+The Windows SDK path may vary. The example below uses the SDK version that was used during testing.
 
 ```bash
-/opt/
-├── [...]
-├── rocm -> /etc/alternatives/rocm
-├── rocm-7.2.0
-└── [...]
-```
-
-3. Build the librocdxg.
-
-```bash
-# Set the Windows SDK path (adjust version number if different)
-export win_sdk='/mnt/c/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/'
- 
-# Build the library
 mkdir -p build
 cd build
-cmake .. -DWIN_SDK="${win_sdk}/shared"
-make
+cmake .. -DWIN_SDK='/mnt/c/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared'
+make -j$(nproc)
 sudo make install
 ```
 
-> ***Note***
-> - The Windows SDK path may vary depending on the version you installed. Common locations include:
->   - C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\
-> - Ensure you have the necessary permissions to access the Windows SDK directory from WSL
+If you have a different SDK version, adjust the path under:
 
-### 4. Load the AMD ROCDXG libary
+```text
+C:\Program Files (x86)\Windows Kits\10\Include\
+```
 
-Set the environment variable HSA_ENABLE_DXG_DETECTION=1 to load librocdxg.so.
+## WSL Environment Variables To Use
+
+These are the important runtime variables for the RX 6700S setup tested here:
 
 ```bash
 export HSA_ENABLE_DXG_DETECTION=1
+export HSA_OVERRIDE_GFX_VERSION=10.3.0
+export HSA_ENABLE_SDMA=0
+export HSA_ENABLE_PEER_SDMA=0
+export LIBROCDXG_ALLOC_USER_QUEUE_FROM_UMD=1
 ```
 
-### 5. Post-install verification checks
-Run these post-installation checks to verify that the installation is complete.
+What they mean:
 
-Check if the GPU is listed as an agent:
+1. `HSA_ENABLE_DXG_DETECTION=1`
+   Tells ROCm to look for the GPU through WSL DXG
+
+2. `HSA_OVERRIDE_GFX_VERSION=10.3.0`
+   Makes the 6700S run as `gfx1030`
+
+3. `HSA_ENABLE_SDMA=0`
+   Disables the SDMA copy engine path that was hanging during tensor copies
+
+4. `HSA_ENABLE_PEER_SDMA=0`
+   Disables the related peer SDMA path too
+
+5. `LIBROCDXG_ALLOC_USER_QUEUE_FROM_UMD=1`
+   Enables the queue allocation path that worked on this machine
+
+### Recommended Persistent Bash Setup
+
+Add this block to your `~/.bashrc` and `~/.profile`:
+
+```bash
+if [ -n "${WSL_DISTRO_NAME:-}" ]; then
+    export HSA_ENABLE_DXG_DETECTION=1
+    export HSA_OVERRIDE_GFX_VERSION=10.3.0
+    export HSA_ENABLE_SDMA=0
+    export HSA_ENABLE_PEER_SDMA=0
+    export LIBROCDXG_ALLOC_USER_QUEUE_FROM_UMD=1
+fi
+```
+
+That way, every new WSL shell gets the working settings automatically.
+
+## How To Run And Test
+
+Here is the simplest way to verify whether the stack is working.
+
+### 1. Check that ROCm sees the GPU
 
 ```bash
 rocminfo
 ```
 
-Expected result:
+You want to see the GPU listed as an agent.
+
+### 2. Run a basic PyTorch check
 
 ```bash
-[...]
-*******
-Agent 2
-*******
-  Name:                    gfx1100
-  Marketing Name:          Radeon RX 7900 XTX
-  Vendor Name:             AMD
-  [...]
-[...]
-
+python - <<'PY'
+import torch
+print("available", torch.cuda.is_available())
+print("count", torch.cuda.device_count())
+print("name", torch.cuda.get_device_name(0))
+x = torch.tensor([1.0, 2.0, 3.0], device="cuda")
+print("copy_ok", x.cpu().tolist())
+PY
 ```
 
-### 6. Container Launch – WSL-Specific Flags
+Expected output should look roughly like this:
 
-When you launch the container, add these WSL-specific arguments (they do not replace the native-Linux GPU flags):
+```text
+available True
+count 1
+name AMD Radeon RX 6700S
+copy_ok [1.0, 2.0, 3.0]
+```
+
+### 3. Run a repeated copy test
+
+This is closer to what exposed the original failure:
+
+```bash
+python - <<'PY'
+import torch
+device = "cuda"
+cpu = torch.arange(1024 * 1024, dtype=torch.float32)
+for i in range(3):
+    gpu = cpu.to(device)
+    y = (gpu + 1).sum()
+    print(i, float(y.cpu()))
+PY
+```
+
+If this finishes instead of hanging, your runtime path is in much better shape.
+
+## How I Tested This Fork
+
+The validation path for this repo was:
+
+1. Build `librocdxg.so` in WSL with CMake
+2. Install or preload the built library
+3. Export the RX 6700S WSL environment variables listed above
+4. Run `rocminfo`
+5. Run a PyTorch probe that:
+   1. checks CUDA availability
+   2. reads the device name
+   3. allocates a small GPU tensor
+   4. copies data from CPU to GPU
+   5. copies results back to CPU
+6. Repeat the test across multiple fresh Python processes
+
+This fork also passed repeated runtime tests using the freshly built library instead of only the installed copy.
+
+## Common Problems
+
+### Problem: `rocminfo` fails at `hsa_init`
+
+Check:
+
+1. WSL is installed correctly
+2. `/dev/dxg` exists inside WSL
+3. `/usr/lib/wsl/lib/libdxcore.so` exists
+4. `HSA_ENABLE_DXG_DETECTION=1` is set
+
+### Problem: PyTorch sees the GPU, but hangs at tensor copy
+
+This was the main RX 6700S problem during testing.
+
+Make sure these are set:
+
+```bash
+export HSA_ENABLE_SDMA=0
+export HSA_ENABLE_PEER_SDMA=0
+export LIBROCDXG_ALLOC_USER_QUEUE_FROM_UMD=1
+```
+
+### Problem: PyTorch reports `available True`, but real work still fails
+
+That usually means the stack is only at the “device visible” stage, not the “device actually usable” stage.
+
+Run the repeated copy test above, not just `torch.cuda.is_available()`.
+
+### Problem: You see `Warning: Windows driver is old, please update it.`
+
+That warning appeared during testing even when the runtime tests worked. It is still a good idea to update the Windows AMD driver if you can.
+
+## Optional Environment Variables For Debugging
+
+Most users do not need these, but they were useful while debugging:
+
+1. `LIBROCDXG_FORCE_HWS=1`
+2. `LIBROCDXG_DISABLE_HWS=1`
+3. `LIBROCDXG_DISABLE_PLATFORM_ATOMIC=1`
+4. `LIBROCDXG_KEEP_SCRATCH_INDEX_STRIDE=1`
+5. `LIBROCDXG_DEBUG_WRITE_MARKER=1`
+
+These are for troubleshooting. They are not part of the normal RX 6700S runtime setup.
+
+## Container Notes
+
+If you use containers under WSL, you still need the WSL specific DXG device and libraries:
 
 | Flag | Purpose |
 | ---- | ------- |
-| `--device /dev/dxg` | Pass the `/dev/dxg` device node into the container so applications inside the container can access the GPU. |
-| `-v /usr/lib/wsl/lib/libdxcore.so:/usr/lib/libdxcore.so`<br>`-v /opt/rocm/lib/librocdxg.so:/usr/lib/librocdxg.so` | Make the AMD ROCDXG and Microsoft DXCore libraries available inside the container so that ROCm/HIP applications can route their GPU compute calls through ROCDXG and DXCore to communicate with the GPU. |
-| `-e HSA_ENABLE_DXG_DETECTION=1` | Tells the HSA runtime to detect GPU exposed via the DXG device (`/dev/dxg`) and to load the ROCDXG library. |
+| `--device /dev/dxg` | Exposes the WSL GPU device to the container |
+| `-v /usr/lib/wsl/lib/libdxcore.so:/usr/lib/libdxcore.so` | Makes DXCore available inside the container |
+| `-v /opt/rocm/lib/librocdxg.so:/usr/lib/librocdxg.so` | Makes ROCDXG available inside the container |
+| `-e HSA_ENABLE_DXG_DETECTION=1` | Enables WSL GPU detection inside the container |
 
-Example docker run command:
+Example:
 
 ```bash
-docker run -it  \
+docker run -it \
     -v /usr/lib/wsl/lib/libdxcore.so:/usr/lib/libdxcore.so \
     -v /opt/rocm/lib/librocdxg.so:/usr/lib/librocdxg.so \
     -e HSA_ENABLE_DXG_DETECTION=1 \
@@ -126,25 +323,18 @@ docker run -it  \
     rocm/pytorch:latest
 ```
 
-## 7. Known Issues and Limitations
+## Known Limitations
 
-- The ROCm-supported version of JAX is not currently enabled or validated under WSL. As a result, JAX workloads on WSL may fail to install, initialize, or execute correctly.
-- Monitoring: `AMD-smi` are not supported. GPU metrics (temperature, clocks, and power) must be monitored via Windows-native tools such as Task Manager or AMD Software: Adrenalin Edition.
-- Debugging/Profiling: `ROCm-profiler`, `Debugger` are not supported.
-
-## WSL Compatiblity Matrix
-- Windows 11
-- Ubuntu 24.04 LTS / Ubuntu 22.04 LTS
-- The AMD ROCDXG library utilizes a ROCm runtime feature introduced in ROCm 7.1, which loads ***librocdxg*** to enable ROCm functionality within the WSL environment. This design keeps the ***librocdxg*** solution loosely coupled with both AMD ROCm release and Windows display driver. As a result, the AMD ROCDXG library can evolve independently, following its own development schedule without impacting the existing ROCm solution.
-
-| AMD Rocdxg Lib Version | AMD ROCm Version | AMD Windows Driver Version | Supported AMD GPU Products |
-| ---------------------- | ---------------- | -------------------------- | -------------------------- |
-| 1.1.0                  | 7.2.x              | AMD Windows x86 drivers can be directly downloaded from [AMD Driver](https://www.amd.com/en/support/download/drivers.html) | ***Radeon***<br><br>AMD Radeon RX 9070<br>AMD Radeon RX 9070 XT<br>AMD Radeon RX 9070 GRE<br>AMD Radeon AI PRO R9700<br>AMD Radeon RX 9060<br>AMD Radeon RX 9060 XT<br>AMD Radeon RX 7900 XTX<br>AMD Radeon RX 7900 XT<br>AMD Radeon RX 7900 GRE<br>AMD Radeon PRO W7900<br>AMD Radeon PRO W7900 Dual Slot<br>AMD Radeon PRO W7800<br>AMD Radeon PRO W7800 48GB<br>AMD Radeon RX 7800 XT<br>AMD Radeon PRO W7700<br><br>***Ryzen***<br><br>AMD Ryzen AI Max+ 395<br>AMD Ryzen AI Max 390<br>AMD Ryzen AI Max 385<br>AMD Ryzen AI 9 HX 375<br>AMD Ryzen AI 9 HX 370<br>AMD Ryzen AI 9 365 |
-
+1. JAX under WSL is not covered by this repo
+2. `amd-smi` style monitoring is not supported the same way it is on native Linux
+3. Some driver and hardware combinations may still behave differently from the RX 6700S setup documented here
 
 ## Documentation
 
-For detailed documentation—including ROCm installation guides, configuration options, and metric descriptions—see "[Use ROCm on Radeon and Ryzen](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/index.html#)".
+For general ROCm documentation, see:
+
+[Use ROCm on Radeon and Ryzen](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/index.html#)
 
 ## Contributing
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on setting up your WSL environment, building, and submitting pull requests.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the general contribution process.
