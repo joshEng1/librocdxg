@@ -2,15 +2,11 @@
 
 This fork is a patched `librocdxg` build for getting ROCm to work on an AMD Radeon RX 6700S laptop GPU under WSL 2. 
 
-The important idea is simple:
-
 1. WSL can sometimes see the GPU without being able to actually use it
 2. This fork adds the fixes that made real GPU execution work on an RX 6700S
 3. You still need the right WSL and bash environment variables when you run ROCm or PyTorch
 
 ## Who This Is For
-
-This repo is for people who:
 
 1. Use WSL 2 on Windows
 2. Have a gfx1032 GPU.
