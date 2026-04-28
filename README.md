@@ -273,10 +273,6 @@ That usually means the stack is only at the “device visible” stage, not the 
 
 Run the repeated copy test above, not just `torch.cuda.is_available()`.
 
-### Problem: You see `Warning: Windows driver is old, please update it.`
-
-That warning appeared during testing even when the runtime tests worked. It is still a good idea to update the Windows AMD driver if you can.
-
 ## Optional Environment Variables For Debugging
 
 Most users do not need these, but they were useful while debugging:
